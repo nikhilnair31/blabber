@@ -1,10 +1,15 @@
 from dotenv import load_dotenv
 import shutil
+from datetime import datetime
 import subprocess
 from typing import Iterator
+import multiprocessing
+import threading
 import requests
 import logging
+import asyncio
 import os
+import traceback
 from groq import Groq
 from time import sleep
 import keyboard
@@ -14,17 +19,28 @@ load_dotenv()
 
 NEETS_API_KEY = os.environ.get("NEETS_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-messages = [{"role": "system", "content": "You are a helpful AI assitant"}]
+
+messages = [
+    {
+        "role": "system", 
+        "content": """
+            You are a helpful AI assitant.
+        """.strip()
+    }
+]
 ongoing_transcript = ""
 
 deepgram = DeepgramClient()
 groq = Groq(api_key=GROQ_API_KEY)
+
+audio_process = None
 
 def stt():
     dg_connection = deepgram.listen.live.v("1")
 
     def on_message(self, result, **kwargs):
         global ongoing_transcript
+
         sentence = result.channel.alternatives[0].transcript
         if sentence.strip() == "":
             return
@@ -32,17 +48,15 @@ def stt():
             print(f"speaker:\n{sentence}")
             if result.is_final:
                 ongoing_transcript += sentence + " "
-                # ongoing_transcript = sentence
     def on_utterance_end(self, utterance_end, **kwargs):
         global ongoing_transcript
-        print(f"\nUtterance ended.\n{utterance_end}\nTranscribed text:\n{ongoing_transcript}\n")
+
+        print(f"\nUtterance ended. Transcribed text:\n{ongoing_transcript}\n")
         messages.append({"role": "user", "content": ongoing_transcript})
-        generate_ai_response()
+        llm_response()
         ongoing_transcript = ""
     def on_metadata(self, metadata, **kwargs):
         print(f"\n\n{metadata}\n\n")
-    def on_speech_started(self, speech_started, **kwargs):
-        print(f"\n\n{speech_started}\n\n")
     def on_error(self, error, **kwargs):
         print(f"\n\n{error}\n\n")
     def on_close(self, close, **kwargs):
@@ -88,29 +102,38 @@ def stt():
     keyboard.add_hotkey('q', toggle_transcription)
 
     while True:
-        sleep(1)
+        sleep(0.1)
 
-def play_stream(audio_stream: Iterator[bytes]) -> bytes:
-    process = subprocess.Popen(
+def interrupt_and_play_stream(audio_stream: Iterator[bytes]):
+    global audio_process
+    
+    print(f"audio_process is not None: {audio_process is not None}")
+    if audio_process is not None:
+        audio_process.kill()
+        audio_process.wait()
+        print(f"Process killed!")
+
+    audio_process = subprocess.Popen(
         ["mpv", "--no-cache", "--no-terminal", "--", "fd://0"],
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-
-    audio = b""
+    print(f"new audio_process is not None: {audio_process is not None}")
 
     for chunk in audio_stream:
         if chunk is not None:
-            process.stdin.write(chunk)
-            process.stdin.flush()
-            audio += chunk
+            audio_process.stdin.write(chunk)
+            audio_process.stdin.flush()
 
-    if process.stdin:
-        process.stdin.close()
-
-    process.wait()
-def say(text: str):
+    if audio_process.stdin:
+        audio_process.stdin.close()
+    audio_process.wait()
+    audio_process = None
+    print(f"final audio_process is not None: {audio_process is not None}")
+def play_stream_async(audio_stream: Iterator[bytes]):
+    threading.Thread(target=interrupt_and_play_stream, args=(audio_stream,)).start()
+def tts(text: str):
     response = requests.request(
         method="POST",
         url="https://api.neets.ai/v1/tts",
@@ -128,10 +151,13 @@ def say(text: str):
     )
 
     audio_stream = response.iter_content(chunk_size=None)
-    play_stream(audio_stream)
+    play_stream_async(audio_stream)
 
-def generate_ai_response():
+def llm_response():
     global messages
+
+    start_time = datetime.now()
+
     chat_completion = groq.chat.completions.create(
         messages = messages,
         model="mixtral-8x7b-32768",
@@ -154,13 +180,19 @@ def generate_ai_response():
     messages.append({"role": "assistant", "content": response})
     print(f"assistant:\n{response}\n")
 
-    say(response)
+    # Calculate and print the LLM response time
+    llm_response_time_seconds = (datetime.now() - start_time).total_seconds()
+    print(f"LLM Response Time: {llm_response_time_seconds}s\n")
+
+    tts_process = multiprocessing.Process(target=tts, args=(response, ))
+    tts_process.start()
 
 def main():
     try:
         stt()
     except Exception as e:
         print(f"Error:\n{e}")
+        traceback.print_exc()
         return
 
 if __name__ == "__main__":
